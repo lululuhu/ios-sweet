@@ -1,0 +1,88 @@
+name: lemonades
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [xnu]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: lemonades-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # OnePlus 9R (lemonades, SM8250/kona) boot images from the sweet xnu kernel:
+    # probe image (empty ramdisk -> shim hardware diagnostics screen) plus the
+    # XNU image (payload ramdisk). Same sweet kernel; lemonades ADT + kona dtb.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the xnu run to use
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = workflow_run ]; then
+            rid="${{ github.event.workflow_run.id }}"
+          else
+            rid=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/xnu.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+          fi
+          [ -n "$rid" ] || { echo "::error::no successful xnu run found; trigger the xnu workflow first"; exit 1; }
+          echo "XNU_RUN_ID=$rid" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          run-id: ${{ env.XNU_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu cpio device-tree-compiler
+
+      - name: Build kona-v2.1 dtb (lemonades base; board-id <0 0> wildcard)
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/LineageOS/android_kernel_oneplus_sm8250 kernel
+          git -C kernel sparse-checkout set arch/arm64/boot/dts include/dt-bindings
+          cpp -nostdinc -undef -x assembler-with-cpp \
+            -I kernel/include \
+            -I kernel/arch/arm64/boot/dts/vendor \
+            -I kernel/arch/arm64/boot/dts/vendor/qcom \
+            -I kernel/arch/arm64/boot/dts/vendor/oplus \
+            kernel/arch/arm64/boot/dts/vendor/oplus/kona-v2.1.dts > kona-v2.1.pp.dts
+          dtc -q -I dts -O dtb -o kona-v2.1.dtb kona-v2.1.pp.dts
+          ls -l kona-v2.1.dtb
+
+      - name: lemonades ADT + XNU payload
+        run: |
+          mkdir -p out
+          KERN=$(ls kernel.development.* | head -1)
+          [ -n "$KERN" ] || { ls -l; exit 1; }
+          python3 tools/mkadt.py out/lemonades.adt --lemonades --highmem
+          python3 tools/mkpayload.py "$KERN" out/lemonades.adt out/payload.bin \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress sweettouch=0 sweetkeys=0'
+
+      - name: Build shim boot images
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/mkbootimg
+          make -C mkbootimg -j"$(nproc)"
+          sudo install -m755 mkbootimg/mkbootimg /usr/local/bin/mkbootimg
+          mkdir -p images
+          # probe image: empty ramdisk -> shim hardware diagnostics on screen
+          SHIM_DTB="$PWD/kona-v2.1.dtb" bash shim/build.sh
+          cp shim/out/shim-boot.img images/shim-boot-lemonades-probe.img
+          # XNU image: the payload as ramdisk
+          SHIM_DTB="$PWD/kona-v2.1.dtb" bash shim/build.sh "$PWD/out/payload.bin"
+          cp shim/out/shim-boot.img images/shim-boot-lemonades-xnu.img
+          ls -l images/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemonades-boot-images
+          path: images/
+          retention-days: 14

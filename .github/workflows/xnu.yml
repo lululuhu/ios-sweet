@@ -20,6 +20,7 @@ on:
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
+  workflow_call: {}
 
 concurrency:
   group: xnu-${{ github.ref }}

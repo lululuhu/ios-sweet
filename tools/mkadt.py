@@ -2,7 +2,12 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--lemonades]
+
+--lemonades re-targets the tree for the OnePlus 9R (SM8250/kona): the GIC,
+UFS host, framebuffer base and MPIDR layout match sweet exactly, but kona's
+cont-splash window is larger, the CPU cluster is 4xA55 + 3xA77 + 1xA77 prime
+and the DDR upper bank is bigger (8G/12G models).
 """
 import hashlib, os, struct, sys
 
@@ -17,6 +22,12 @@ MEM_SIZE = 0x4d000000
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
 HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
+# --lemonades (OnePlus 9R, SM8250/kona): kona's cont_splash_region is
+# <0x9c000000 0x2300000> (wider than sweet's window) and the upper DDR bank
+# of the 8G/12G models is >= 5.5G; 0xe0000000 stays conservative until the
+# live FDT memory node has been read off the phone.
+LEMONADES_FB_SIZE = 0x2300000
+LEMONADES_HIGH_MEM_SIZE = 0xe0000000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -32,6 +43,11 @@ VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+
+# kona (SM8250-AC, OnePlus 9R): cores 0-3 silver A55 @1.8048G, 4-6 gold A77
+# @2.4192G, 7 gold+ A77 @3.1968G. Descriptive only; XNU never gates on it.
+def lemonades_cpu_freq(core):
+    return 3196800000 if core == 7 else 2419200000 if core >= 4 else 1804800000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -68,9 +84,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, lemonades=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    phys_base, mem_size = (HIGH_PHYS_BASE, LEMONADES_HIGH_MEM_SIZE if lemonades else HIGH_MEM_SIZE) \
+        if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -122,13 +139,15 @@ def build(seed=None, qemu=False, highmem=False):
     # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
     # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
+    # LEMONADES (kona): 0-3 Cortex-A55, 4-6 A77, 7 A77 prime -- same physical
+    # core order and the very same MPIDR layout (Aff1 = core number).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', cstr('qcom,kryo585' if lemonades else 'qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -139,7 +158,8 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(lemonades_cpu_freq(core) if lemonades
+                                    else 2304000000 if core >= 6 else 1804800000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -181,7 +201,7 @@ def build(seed=None, qemu=False, highmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
+        ('reg', u64(FB, LEMONADES_FB_SIZE if lemonades else FB_SIZE)),
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
@@ -214,10 +234,16 @@ def build(seed=None, qemu=False, highmem=False):
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching
+    # (lemonades keeps it too: the platform expert matches on it, not on the
+    # board-specific entries that follow).
+    compat = cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('AppleARM') \
+        if not lemonades else \
+        cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') \
+        + cstr('oneplus,lemonades') + cstr('qcom,sm8250') + cstr('AppleARM')
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', compat),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -228,7 +254,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 lemonades='--lemonades' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
