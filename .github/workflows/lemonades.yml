@@ -70,6 +70,9 @@ jobs:
       - name: Build shim boot images
         run: |
           git clone --depth 1 https://github.com/osm0sis/mkbootimg
+          # GCC 14 turns an rsa.c stringop-overflow false positive into an
+          # error via the Makefile's own -Werror; the code is fine, drop it.
+          sed -i 's/ -Werror//g' mkbootimg/Makefile mkbootimg/libmincrypt/Makefile
           make -C mkbootimg -j"$(nproc)"
           sudo install -m755 mkbootimg/mkbootimg /usr/local/bin/mkbootimg
           mkdir -p images
